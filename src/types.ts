@@ -6,6 +6,27 @@ export interface AuthorizedUser {
   phone: string;
 }
 
+export type CodeDeliveryType =
+  | "app"
+  | "email"
+  | "sms"
+  | "call"
+  | "fragment"
+  | "firebase"
+  | "setup_email"
+  | "unknown";
+
+export interface AuthDeliveryInfo {
+  deliveryType: CodeDeliveryType;
+  label: string;
+  detail: string;
+  emailPattern: string;
+  fragmentUrl: string;
+  codeLength: number;
+  nextTypeLabel: string;
+  timeoutSeconds: number;
+}
+
 export interface TargetGroup {
   id: string;
   title: string;

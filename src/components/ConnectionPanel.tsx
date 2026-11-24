@@ -1,18 +1,24 @@
-import React, { useState } from "react";
+import React, { useEffect, useState } from "react";
 import {
+  AlertCircle,
   Bell,
+  Check,
   CheckCircle2,
+  Copy,
+  ExternalLink,
   Eye,
   EyeOff,
   HelpCircle,
   KeyRound,
   LogOut,
+  Mail,
   Phone,
+  QrCode,
   RefreshCw,
   ShieldCheck,
-  AlertCircle,
+  Upload,
 } from "lucide-react";
-import type { AuthorizedUser } from "../types";
+import type { AuthDeliveryInfo, AuthorizedUser } from "../types";
 
 interface ConnectionPanelProps {
   apiId: string;
@@ -32,7 +38,8 @@ interface ConnectionPanelProps {
   onNavigateNext: () => void;
 }
 
-type AuthStep = "credentials" | "code" | "password";
+type AuthMethod = "phone" | "qr" | "session";
+type AuthStep = "credentials" | "setup_email" | "setup_email_code" | "code" | "password";
 
 export const ConnectionPanel: React.FC<ConnectionPanelProps> = ({
   apiId,
@@ -51,20 +58,157 @@ export const ConnectionPanel: React.FC<ConnectionPanelProps> = ({
   onUserChanged,
   onNavigateNext,
 }) => {
+  const [authMethod, setAuthMethod] = useState<AuthMethod>("phone");
   const [authStep, setAuthStep] = useState<AuthStep>("credentials");
+
   const [phoneCode, setPhoneCode] = useState("");
+  const [setupEmail, setSetupEmail] = useState("");
+  const [setupEmailCode, setSetupEmailCode] = useState("");
   const [twoFaPassword, setTwoFaPassword] = useState("");
   const [passwordHint, setPasswordHint] = useState("");
-  const [isCodeViaApp, setIsCodeViaApp] = useState(true);
-  const [showSecrets, setShowSecrets] = useState(false);
 
+  const [deliveryInfo, setDeliveryInfo] = useState<AuthDeliveryInfo | null>(null);
+  const [resendCooldown, setResendCooldown] = useState(0);
+
+  const [qrDataUrl, setQrDataUrl] = useState("");
+  const [qrActive, setQrActive] = useState(false);
+
+  const [manualSessionInput, setManualSessionInput] = useState("");
+  const [showSavedSessionBox, setShowSavedSessionBox] = useState(false);
+  const [copiedSession, setCopiedSession] = useState(false);
+
+  const [showSecrets, setShowSecrets] = useState(false);
   const [authLoading, setAuthLoading] = useState(false);
+  const [resendLoading, setResendLoading] = useState(false);
   const [authError, setAuthError] = useState("");
   const [authNotice, setAuthNotice] = useState("");
 
   const [botLoading, setBotLoading] = useState(false);
   const [botStatus, setBotStatus] = useState<{ type: "ok" | "err"; text: string } | null>(null);
   const [showGuide, setShowGuide] = useState(false);
+
+  // عداد تنازلي لإتاحة زر إعادة الإرسال عبر القناة البديلة (SMS / مكالمة)
+  useEffect(() => {
+    if (resendCooldown <= 0) return;
+    const timer = setInterval(() => {
+      setResendCooldown((prev) => (prev > 0 ? prev - 1 : 0));
+    }, 1000);
+    return () => clearInterval(timer);
+  }, [resendCooldown]);
+
+  // استطلاع حالة مسح رمز QR تلقائياً كل 2.5 ثانية عند تفعيل QR
+  useEffect(() => {
+    if (!qrActive || user || authMethod !== "qr" || authStep !== "credentials") {
+      return;
+    }
+
+    let cancelled = false;
+    const interval = setInterval(() => {
+      void (async () => {
+        try {
+          const res = await fetch("/api/auth/qr/poll", { method: "POST" });
+          const data = await res.json();
+          if (cancelled) return;
+
+          if (!res.ok) {
+            setQrActive(false);
+            setAuthError(data.error || "انتهت صلاحية رمز QR. اضغط لتوليد رمز جديد.");
+            return;
+          }
+
+          if (data.status === "authorized") {
+            setQrActive(false);
+            setQrDataUrl("");
+            onUserChanged(data.user);
+            if (data.sessionString) onSessionSaved(data.sessionString);
+            setAuthNotice("تم تسجيل الدخول بنجاح عبر رمز QR.");
+            return;
+          }
+
+          if (data.status === "password_required") {
+            setQrActive(false);
+            setPasswordHint(data.hint || "");
+            setAuthStep("password");
+            setAuthNotice("تم مسح الرمز بنجاح. أدخل كلمة مرور التحقق بخطوتين (2FA) لإتمام الدخول.");
+            return;
+          }
+
+          if (data.status === "qr_pending" && data.qrDataUrl) {
+            setQrDataUrl(data.qrDataUrl);
+          }
+        } catch {
+          // تجاهل أخطاء الشبكة العابرة أثناء الاستطلاع
+        }
+      })();
+    }, 2500);
+
+    return () => {
+      cancelled = true;
+      clearInterval(interval);
+    };
+  }, [qrActive, user, authMethod, authStep, onUserChanged, onSessionSaved]);
+
+  const cancelPendingCodeOnServer = async () => {
+    try {
+      await fetch("/api/auth/cancel-code", { method: "POST" });
+    } catch {
+      // تجاهل
+    }
+  };
+
+  const switchAuthMethod = async (nextMethod: AuthMethod) => {
+    if (nextMethod === authMethod) return;
+    if (qrActive) setQrActive(false);
+    if (authStep !== "credentials") {
+      await cancelPendingCodeOnServer();
+    }
+    setAuthMethod(nextMethod);
+    setAuthStep("credentials");
+    setAuthError("");
+    setAuthNotice("");
+  };
+
+  const applyCodeResponse = (data: {
+    status: string;
+    deliveryInfo?: AuthDeliveryInfo;
+    user?: AuthorizedUser;
+    sessionString?: string;
+    hint?: string;
+  }) => {
+    if (data.status === "authorized" && data.user) {
+      onUserChanged(data.user);
+      if (data.sessionString) onSessionSaved(data.sessionString);
+      setAuthStep("credentials");
+      setPhoneCode("");
+      setAuthNotice("تم تسجيل الدخول بنجاح.");
+      return;
+    }
+
+    if (data.status === "password_required") {
+      setPasswordHint(data.hint || "");
+      setAuthStep("password");
+      setAuthNotice("الحساب محمي بالتحقق بخطوتين (2FA). أدخل كلمة المرور للمتابعة.");
+      return;
+    }
+
+    if (data.status === "setup_email_required") {
+      setDeliveryInfo(data.deliveryInfo ?? null);
+      setAuthStep("setup_email");
+      setAuthNotice(
+        data.deliveryInfo?.detail ||
+          "تيليجرام يطلب تأكيد بريد إلكتروني لهذا الرقم قبل إرسال الكود."
+      );
+      return;
+    }
+
+    if (data.status === "code_required") {
+      const info = data.deliveryInfo ?? null;
+      setDeliveryInfo(info);
+      setResendCooldown(info?.timeoutSeconds && info.timeoutSeconds > 0 ? info.timeoutSeconds : 60);
+      setAuthStep("code");
+      setAuthNotice(info?.detail || "تم إرسال طلب رمز التحقق من خوادم تيليجرام.");
+    }
+  };
 
   const handleSendCode = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -77,9 +221,9 @@ export const ConnectionPanel: React.FC<ConnectionPanelProps> = ({
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          apiId: Number(apiId),
-          apiHash,
-          phoneNumber,
+          apiId: apiId.trim(),
+          apiHash: apiHash.trim(),
+          phoneNumber: phoneNumber.trim(),
         }),
       });
       const data = await res.json();
@@ -87,25 +231,81 @@ export const ConnectionPanel: React.FC<ConnectionPanelProps> = ({
         setAuthError(data.error || "تعذر إرسال رمز التحقق.");
         return;
       }
-
-      if (data.status === "authorized") {
-        onUserChanged(data.user);
-        if (data.sessionString) onSessionSaved(data.sessionString);
-        setAuthNotice("تم تسجيل الدخول بنجاح.");
-      } else if (data.status === "code_required") {
-        setIsCodeViaApp(Boolean(data.isCodeViaApp));
-        setAuthStep("code");
-        setAuthNotice(
-          data.isCodeViaApp
-            ? "تم إرسال رمز التحقق إلى تطبيق تيليجرام على جهازك."
-            : "تم إرسال رمز التحقق عبر رسالة نصية SMS إلى هاتفك."
-        );
-      } else if (data.status === "password_required") {
-        setPasswordHint(data.hint || "");
-        setAuthStep("password");
-      }
+      applyCodeResponse(data);
     } catch {
       setAuthError("تعذر الاتصال بالخادم. يرجى المحاولة مرة أخرى.");
+    } finally {
+      setAuthLoading(false);
+    }
+  };
+
+  const handleResendCode = async () => {
+    setAuthError("");
+    setAuthNotice("");
+    setResendLoading(true);
+
+    try {
+      const res = await fetch("/api/auth/resend-code", { method: "POST" });
+      const data = await res.json();
+      if (!res.ok) {
+        setAuthError(data.error || "تعذر إعادة إرسال الكود عبر القناة البديلة.");
+        return;
+      }
+      applyCodeResponse(data);
+    } catch {
+      setAuthError("تعذر الاتصال بالخادم لإعادة الإرسال.");
+    } finally {
+      setResendLoading(false);
+    }
+  };
+
+  const handleSendSetupEmail = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setAuthError("");
+    setAuthNotice("");
+    setAuthLoading(true);
+
+    try {
+      const res = await fetch("/api/auth/setup-email/send", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ email: setupEmail.trim() }),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        setAuthError(data.error || "تعذر إرسال رمز التحقق للبريد الإلكتروني.");
+        return;
+      }
+      setAuthStep("setup_email_code");
+      setAuthNotice(`تم إرسال رمز مكون من 6 أرقام إلى بريدك (${data.email}).`);
+    } catch {
+      setAuthError("تعذر الاتصال بالخادم.");
+    } finally {
+      setAuthLoading(false);
+    }
+  };
+
+  const handleVerifySetupEmail = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setAuthError("");
+    setAuthNotice("");
+    setAuthLoading(true);
+
+    try {
+      const res = await fetch("/api/auth/setup-email/verify", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ code: setupEmailCode.trim() }),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        setAuthError(data.error || "رمز البريد الإلكتروني غير صحيح.");
+        return;
+      }
+      setSetupEmailCode("");
+      applyCodeResponse(data);
+    } catch {
+      setAuthError("تعذر التحقق من رمز البريد الإلكتروني.");
     } finally {
       setAuthLoading(false);
     }
@@ -121,25 +321,14 @@ export const ConnectionPanel: React.FC<ConnectionPanelProps> = ({
       const res = await fetch("/api/auth/verify-code", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ phoneCode }),
+        body: JSON.stringify({ phoneCode: phoneCode.trim() }),
       });
       const data = await res.json();
       if (!res.ok) {
         setAuthError(data.error || "رمز التحقق غير صحيح.");
         return;
       }
-
-      if (data.status === "password_required") {
-        setPasswordHint(data.hint || "");
-        setAuthStep("password");
-        setAuthNotice("الحساب محمي بالتحقق بخطوتين (2FA). أدخل كلمة المرور للمتابعة.");
-      } else if (data.status === "authorized") {
-        onUserChanged(data.user);
-        if (data.sessionString) onSessionSaved(data.sessionString);
-        setAuthStep("credentials");
-        setPhoneCode("");
-        setAuthNotice("تم تأكيد الحساب وتسجيل الدخول بنجاح.");
-      }
+      applyCodeResponse(data);
     } catch {
       setAuthError("حدث خطأ أثناء التحقق من الرمز.");
     } finally {
@@ -171,6 +360,8 @@ export const ConnectionPanel: React.FC<ConnectionPanelProps> = ({
         setAuthStep("credentials");
         setTwoFaPassword("");
         setPhoneCode("");
+        setQrActive(false);
+        setQrDataUrl("");
         setAuthNotice("تم التحقق بنجاح وتسجيل الدخول.");
       }
     } catch {
@@ -180,9 +371,57 @@ export const ConnectionPanel: React.FC<ConnectionPanelProps> = ({
     }
   };
 
-  const handleRestoreSession = async () => {
-    if (!savedSession || !apiId || !apiHash) {
-      setAuthError("يرجى التأكد من إدخال API ID و API Hash قبل استعادة الجلسة.");
+  const handleStartQr = async () => {
+    if (!apiId.trim() || !apiHash.trim()) {
+      setAuthError("يرجى إدخال API ID و API Hash أولاً قبل توليد رمز QR.");
+      return;
+    }
+    setAuthError("");
+    setAuthNotice("");
+    setAuthLoading(true);
+    setQrActive(false);
+    setQrDataUrl("");
+
+    try {
+      const res = await fetch("/api/auth/qr/start", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          apiId: apiId.trim(),
+          apiHash: apiHash.trim(),
+        }),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        setAuthError(data.error || "تعذر توليد رمز QR.");
+        return;
+      }
+
+      if (data.status === "authorized") {
+        onUserChanged(data.user);
+        if (data.sessionString) onSessionSaved(data.sessionString);
+        setAuthNotice("تم تسجيل الدخول بنجاح.");
+        return;
+      }
+
+      if (data.status === "qr_ready" && data.qrDataUrl) {
+        setQrDataUrl(data.qrDataUrl);
+        setQrActive(true);
+        setAuthNotice(
+          "امسح الرمز الآن من تطبيق تيليجرام على هاتفك: الإعدادات ← الأجهزة ← ربط جهاز سطح المكتب."
+        );
+      }
+    } catch {
+      setAuthError("تعذر الاتصال بالخادم لتوليد رمز QR.");
+    } finally {
+      setAuthLoading(false);
+    }
+  };
+
+  const handleRestoreSession = async (sessionToUse: string) => {
+    const cleanSession = sessionToUse.trim();
+    if (!cleanSession || !apiId.trim() || !apiHash.trim()) {
+      setAuthError("يرجى إدخال API ID و API Hash وكود الجلسة (StringSession) قبل الاستعادة.");
       return;
     }
     setAuthError("");
@@ -194,9 +433,9 @@ export const ConnectionPanel: React.FC<ConnectionPanelProps> = ({
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          apiId: Number(apiId),
-          apiHash,
-          sessionString: savedSession,
+          apiId: apiId.trim(),
+          apiHash: apiHash.trim(),
+          sessionString: cleanSession,
         }),
       });
       const data = await res.json();
@@ -206,7 +445,8 @@ export const ConnectionPanel: React.FC<ConnectionPanelProps> = ({
       }
       onUserChanged(data.user);
       if (data.sessionString) onSessionSaved(data.sessionString);
-      setAuthNotice("تمت استعادة الجلسة السابقة بنجاح.");
+      setManualSessionInput("");
+      setAuthNotice("تم تسجيل الدخول عبر الجلسة المحفوظة بنجاح.");
     } catch {
       setAuthError("تعذر الاتصال بالخادم لاستعادة الجلسة.");
     } finally {
@@ -214,13 +454,28 @@ export const ConnectionPanel: React.FC<ConnectionPanelProps> = ({
     }
   };
 
+  const handleCopySession = async () => {
+    if (!savedSession) return;
+    try {
+      await navigator.clipboard.writeText(savedSession);
+      setCopiedSession(true);
+      setTimeout(() => setCopiedSession(false), 2000);
+    } catch {
+      // تجاهل إذا منع المتصفح النسخ
+    }
+  };
+
   const handleLogout = async () => {
     setAuthLoading(true);
+    setQrActive(false);
+    setQrDataUrl("");
     try {
       await fetch("/api/auth/logout", { method: "POST" });
       onUserChanged(null);
       onSessionSaved("");
       setAuthStep("credentials");
+      setDeliveryInfo(null);
+      setResendCooldown(0);
       setAuthNotice("تم تسجيل الخروج وإغلاق الجلسة بأمان.");
     } finally {
       setAuthLoading(false);
@@ -259,6 +514,15 @@ export const ConnectionPanel: React.FC<ConnectionPanelProps> = ({
     }
   };
 
+  const switchToQrDirectly = async () => {
+    await cancelPendingCodeOnServer();
+    setAuthStep("credentials");
+    setAuthMethod("qr");
+    setAuthError("");
+    setAuthNotice("");
+    await handleStartQr();
+  };
+
   return (
     <div className="space-y-6">
       {/* رأس القسم */}
@@ -268,7 +532,7 @@ export const ConnectionPanel: React.FC<ConnectionPanelProps> = ({
             ربط حساب تيليجرام وبوت الإشعارات
           </h1>
           <p className="mt-1 text-sm text-slate-600">
-            أدخل بيانات واجهة تيليجرام الخاصة بك لتسجيل الدخول مباشرة من المتصفح دون الحاجة لتشغيل أي أوامر برمجية.
+            يدعم الدخول برقم الهاتف (تطبيق / بريد إلكتروني / SMS / اتصال)، أو الدخول الفوري المضمون عبر رمز QR، أو استيراد جلسة محفوظة.
           </p>
         </div>
 
@@ -347,7 +611,19 @@ export const ConnectionPanel: React.FC<ConnectionPanelProps> = ({
           {authError && (
             <div className="mt-4 flex items-start gap-2.5 rounded-lg border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">
               <AlertCircle className="mt-0.5 h-4 w-4 shrink-0" />
-              <span>{authError}</span>
+              <div className="space-y-2">
+                <p>{authError}</p>
+                {authMethod !== "qr" && !user && (
+                  <button
+                    type="button"
+                    onClick={() => void switchToQrDirectly()}
+                    className="inline-flex items-center gap-1.5 text-xs font-semibold text-sky-700 underline hover:text-sky-900"
+                  >
+                    <QrCode className="h-3.5 w-3.5" />
+                    <span>جرّب الدخول الفوري عبر رمز QR (لا يحتاج وصول كود SMS/إيميل)</span>
+                  </button>
+                )}
+              </div>
             </div>
           )}
 
@@ -385,9 +661,60 @@ export const ConnectionPanel: React.FC<ConnectionPanelProps> = ({
                 </button>
               </div>
 
+              {/* نسخ الجلسة المحفوظة كنسخة احتياطية للاستعادة الفورية مستقبلاً */}
+              {savedSession && (
+                <div className="rounded-lg border border-slate-200 bg-slate-50/70 p-4">
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <div>
+                      <p className="text-xs font-semibold text-slate-900">
+                        كود الجلسة الاحتياطي (StringSession)
+                      </p>
+                      <p className="mt-0.5 text-xs text-slate-600">
+                        احتفظ بهذا الكود للدخول المباشر لاحقاً دون الحاجة لطلب رمز تحقق أو مسح QR.
+                      </p>
+                    </div>
+                    <div className="flex items-center gap-2">
+                      <button
+                        type="button"
+                        onClick={() => setShowSavedSessionBox((v) => !v)}
+                        className="rounded-lg border border-slate-200 bg-white px-3 py-1.5 text-xs font-medium text-slate-700 hover:bg-slate-100 whitespace-nowrap"
+                      >
+                        {showSavedSessionBox ? "إخفاء الكود" : "عرض الكود"}
+                      </button>
+                      <button
+                        type="button"
+                        onClick={handleCopySession}
+                        className="inline-flex items-center gap-1.5 rounded-lg border border-slate-200 bg-white px-3 py-1.5 text-xs font-medium text-slate-700 hover:bg-slate-100 whitespace-nowrap"
+                      >
+                        {copiedSession ? (
+                          <>
+                            <Check className="h-3.5 w-3.5 text-emerald-600" />
+                            <span>تم النسخ</span>
+                          </>
+                        ) : (
+                          <>
+                            <Copy className="h-3.5 w-3.5" />
+                            <span>نسخ الجلسة</span>
+                          </>
+                        )}
+                      </button>
+                    </div>
+                  </div>
+                  {showSavedSessionBox && (
+                    <textarea
+                      readOnly
+                      dir="ltr"
+                      rows={3}
+                      value={savedSession}
+                      className="mt-3 w-full rounded-lg border border-slate-200 bg-white p-2.5 text-xs font-mono text-slate-700 outline-none"
+                    />
+                  )}
+                </div>
+              )}
+
               <div className="flex flex-wrap items-center justify-between gap-3 pt-2">
                 <p className="text-xs text-slate-500">
-                  تم حفظ الجلسة مؤقتاً في متصفحك لتسهيل إعادة الاتصال لاحقاً.
+                  تم حفظ الجلسة تلقائياً في متصفحك لتسهيل إعادة الاتصال بنقرة واحدة.
                 </p>
                 <button
                   type="button"
@@ -399,9 +726,10 @@ export const ConnectionPanel: React.FC<ConnectionPanelProps> = ({
               </div>
             </div>
           ) : (
-            <div className="mt-5">
+            <div className="mt-5 space-y-5">
+              {/* استعادة الجلسة المحفوظة تلقائياً بنقرة واحدة */}
               {savedSession && authStep === "credentials" && (
-                <div className="mb-5 flex flex-wrap items-center justify-between gap-3 rounded-lg border border-sky-200 bg-sky-50/60 p-4">
+                <div className="flex flex-wrap items-center justify-between gap-3 rounded-lg border border-sky-200 bg-sky-50/60 p-4">
                   <div>
                     <p className="text-sm font-medium text-slate-900">
                       توجد جلسة سابقة محفوظة في المتصفح
@@ -412,7 +740,7 @@ export const ConnectionPanel: React.FC<ConnectionPanelProps> = ({
                   </div>
                   <button
                     type="button"
-                    onClick={handleRestoreSession}
+                    onClick={() => void handleRestoreSession(savedSession)}
                     disabled={authLoading}
                     className="inline-flex items-center gap-1.5 rounded-lg bg-sky-600 px-4 py-2 text-xs font-medium text-white hover:bg-sky-700 disabled:opacity-50 whitespace-nowrap shrink-0"
                   >
@@ -422,40 +750,86 @@ export const ConnectionPanel: React.FC<ConnectionPanelProps> = ({
                 </div>
               )}
 
+              {/* مفاتيح API المشتركة لجميع طرق الدخول */}
               {authStep === "credentials" && (
-                <form onSubmit={handleSendCode} className="space-y-4">
-                  <div className="grid gap-4 sm:grid-cols-2">
-                    <div>
-                      <label className="mb-1.5 block text-sm font-medium text-slate-700">
-                        Telegram API ID
-                      </label>
-                      <input
-                        type="text"
-                        inputMode="numeric"
-                        dir="ltr"
-                        required
-                        value={apiId}
-                        onChange={(e) => setApiId(e.target.value)}
-                        placeholder="12345678"
-                        className="w-full rounded-lg border border-slate-200 bg-white px-3.5 py-2.5 text-sm font-mono text-slate-900 outline-none focus:border-sky-600 focus:ring-2 focus:ring-sky-600/15"
-                      />
-                    </div>
-                    <div>
-                      <label className="mb-1.5 block text-sm font-medium text-slate-700">
-                        Telegram API Hash
-                      </label>
-                      <input
-                        type={showSecrets ? "text" : "password"}
-                        dir="ltr"
-                        required
-                        value={apiHash}
-                        onChange={(e) => setApiHash(e.target.value)}
-                        placeholder="0123456789abcdef..."
-                        className="w-full rounded-lg border border-slate-200 bg-white px-3.5 py-2.5 text-sm font-mono text-slate-900 outline-none focus:border-sky-600 focus:ring-2 focus:ring-sky-600/15"
-                      />
-                    </div>
+                <div className="grid gap-4 sm:grid-cols-2">
+                  <div>
+                    <label className="mb-1.5 block text-sm font-medium text-slate-700">
+                      Telegram API ID
+                    </label>
+                    <input
+                      type="text"
+                      inputMode="numeric"
+                      dir="ltr"
+                      required
+                      value={apiId}
+                      onChange={(e) => setApiId(e.target.value)}
+                      placeholder="12345678"
+                      className="w-full rounded-lg border border-slate-200 bg-white px-3.5 py-2.5 text-sm font-mono text-slate-900 outline-none focus:border-sky-600 focus:ring-2 focus:ring-sky-600/15"
+                    />
                   </div>
+                  <div>
+                    <label className="mb-1.5 block text-sm font-medium text-slate-700">
+                      Telegram API Hash
+                    </label>
+                    <input
+                      type={showSecrets ? "text" : "password"}
+                      dir="ltr"
+                      required
+                      value={apiHash}
+                      onChange={(e) => setApiHash(e.target.value)}
+                      placeholder="0123456789abcdef..."
+                      className="w-full rounded-lg border border-slate-200 bg-white px-3.5 py-2.5 text-sm font-mono text-slate-900 outline-none focus:border-sky-600 focus:ring-2 focus:ring-sky-600/15"
+                    />
+                  </div>
+                </div>
+              )}
 
+              {/* تبويبات طرق تسجيل الدخول */}
+              {authStep === "credentials" && (
+                <div className="grid grid-cols-3 gap-2 rounded-lg border border-slate-200 bg-slate-50 p-1">
+                  <button
+                    type="button"
+                    onClick={() => void switchAuthMethod("phone")}
+                    className={`flex items-center justify-center gap-1.5 rounded-md px-3 py-2 text-xs font-medium transition-colors whitespace-nowrap ${
+                      authMethod === "phone"
+                        ? "bg-white text-slate-900 shadow-xs border border-slate-200"
+                        : "text-slate-600 hover:text-slate-900"
+                    }`}
+                  >
+                    <Phone className="h-3.5 w-3.5 shrink-0" />
+                    <span>رقم الهاتف والكود</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => void switchAuthMethod("qr")}
+                    className={`flex items-center justify-center gap-1.5 rounded-md px-3 py-2 text-xs font-medium transition-colors whitespace-nowrap ${
+                      authMethod === "qr"
+                        ? "bg-white text-sky-700 shadow-xs border border-slate-200"
+                        : "text-slate-600 hover:text-slate-900"
+                    }`}
+                  >
+                    <QrCode className="h-3.5 w-3.5 shrink-0" />
+                    <span>رمز QR (مضمون)</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => void switchAuthMethod("session")}
+                    className={`flex items-center justify-center gap-1.5 rounded-md px-3 py-2 text-xs font-medium transition-colors whitespace-nowrap ${
+                      authMethod === "session"
+                        ? "bg-white text-slate-900 shadow-xs border border-slate-200"
+                        : "text-slate-600 hover:text-slate-900"
+                    }`}
+                  >
+                    <Upload className="h-3.5 w-3.5 shrink-0" />
+                    <span>استيراد جلسة</span>
+                  </button>
+                </div>
+              )}
+
+              {/* الطريقة 1: رقم الهاتف والكود */}
+              {authStep === "credentials" && authMethod === "phone" && (
+                <form onSubmit={handleSendCode} className="space-y-4">
                   <div>
                     <label className="mb-1.5 block text-sm font-medium text-slate-700">
                       رقم الهاتف (بالصيغة الدولية)
@@ -472,30 +846,265 @@ export const ConnectionPanel: React.FC<ConnectionPanelProps> = ({
                         className="w-full rounded-lg border border-slate-200 bg-white py-2.5 pr-3.5 pl-10 text-sm font-mono text-slate-900 outline-none focus:border-sky-600 focus:ring-2 focus:ring-sky-600/15"
                       />
                     </div>
+                    <p className="mt-1.5 text-xs text-slate-500">
+                      يدعم الأرقام العربية والإنجليزية وصيغة <span className="font-mono">00</span> أو{" "}
+                      <span className="font-mono">+</span>، وكذلك الحسابات المرتبطة ببريد إلكتروني.
+                    </p>
                   </div>
 
-                  <div className="pt-2">
+                  <div className="flex flex-wrap items-center justify-between gap-3 pt-1">
                     <button
                       type="submit"
                       disabled={authLoading}
                       className="inline-flex items-center justify-center gap-2 rounded-lg bg-slate-900 px-5 py-2.5 text-sm font-medium text-white transition-colors hover:bg-slate-800 disabled:opacity-50 whitespace-nowrap shrink-0"
                     >
-                      {authLoading ? "جاري إرسال الرمز..." : "إرسال رمز التحقق"}
+                      {authLoading ? "جاري إرسال الطلب..." : "إرسال رمز التحقق"}
+                    </button>
+
+                    <button
+                      type="button"
+                      onClick={() => void switchToQrDirectly()}
+                      className="inline-flex items-center gap-1.5 text-xs font-medium text-sky-700 hover:text-sky-900 whitespace-nowrap"
+                    >
+                      <QrCode className="h-3.5 w-3.5" />
+                      <span>أو سجّل الدخول بمسح QR دون انتظار كود</span>
                     </button>
                   </div>
                 </form>
               )}
 
-              {authStep === "code" && (
-                <form onSubmit={handleVerifyCode} className="space-y-4">
-                  <p className="text-sm text-slate-600">
-                    {isCodeViaApp
-                      ? "أدخل رمز التحقق الذي وصلك داخل محادثة Telegram الرسمية على جهازك:"
-                      : "أدخل رمز التحقق المرسل عبر رسالة SMS إلى رقمك:"}
-                  </p>
+              {/* الطريقة 2: الدخول السريع عبر QR */}
+              {authStep === "credentials" && authMethod === "qr" && (
+                <div className="space-y-4 rounded-lg border border-slate-200 bg-slate-50/70 p-5">
+                  <div className="space-y-1.5">
+                    <p className="text-sm font-semibold text-slate-900">
+                      الدخول الفوري بمسح رمز QR (لا يتأثر بحجب الأكواد أو البريد)
+                    </p>
+                    <p className="text-xs leading-relaxed text-slate-600">
+                      إذا تأخر وصول رمز التحقق أو حجبته خوادم تيليجرام على رقم معين، امسح هذا الرمز من تطبيق تيليجرام المفتوح على هاتفك لتسجيل الدخول فوراً وبشكل مضمون.
+                    </p>
+                  </div>
+
+                  {qrDataUrl ? (
+                    <div className="flex flex-col items-center gap-4 pt-2 sm:flex-row sm:items-start">
+                      <div className="shrink-0 rounded-xl border border-slate-200 bg-white p-3">
+                        <img
+                          src={qrDataUrl}
+                          alt="رمز QR لتسجيل الدخول إلى تيليجرام"
+                          className="h-52 w-52 object-contain"
+                        />
+                      </div>
+                      <div className="space-y-3 text-xs leading-relaxed text-slate-700">
+                        <p className="font-semibold text-slate-900">خطوات المسح من هاتفك:</p>
+                        <ol className="list-decimal space-y-1.5 pr-4">
+                          <li>افتح تطبيق <span className="font-semibold">تيليجرام</span> على هاتفك.</li>
+                          <li>انتقل إلى <span className="font-semibold">الإعدادات (Settings)</span> ← <span className="font-semibold">الأجهزة (Devices)</span>.</li>
+                          <li>اضغط على <span className="font-semibold">ربط جهاز سطح المكتب (Link Desktop Device)</span>.</li>
+                          <li>وجّه الكاميرا نحو الرمز ليتم الدخول تلقائياً خلال ثوانٍ.</li>
+                        </ol>
+                        <p className="font-medium text-sky-700">
+                          {qrActive ? "بانتظار مسح الرمز من هاتفك..." : "توقف فحص الرمز."}
+                        </p>
+                        <div className="flex flex-wrap items-center gap-2 pt-1">
+                          <button
+                            type="button"
+                            onClick={() => void handleStartQr()}
+                            disabled={authLoading}
+                            className="inline-flex items-center gap-1.5 rounded-lg border border-slate-200 bg-white px-3.5 py-2 text-xs font-medium text-slate-700 hover:bg-slate-100 disabled:opacity-50 whitespace-nowrap"
+                          >
+                            <RefreshCw className={`h-3.5 w-3.5 ${authLoading ? "animate-spin" : ""}`} />
+                            <span>تحديث رمز QR</span>
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setQrActive(false);
+                              setQrDataUrl("");
+                              void cancelPendingCodeOnServer();
+                            }}
+                            className="rounded-lg border border-slate-200 bg-white px-3.5 py-2 text-xs font-medium text-slate-600 hover:bg-slate-100 whitespace-nowrap"
+                          >
+                            إلغاء
+                          </button>
+                        </div>
+                      </div>
+                    </div>
+                  ) : (
+                    <div>
+                      <button
+                        type="button"
+                        onClick={() => void handleStartQr()}
+                        disabled={authLoading}
+                        className="inline-flex items-center gap-2 rounded-lg bg-sky-600 px-5 py-2.5 text-sm font-medium text-white hover:bg-sky-700 disabled:opacity-50 whitespace-nowrap"
+                      >
+                        <QrCode className="h-4 w-4" />
+                        <span>{authLoading ? "جاري توليد رمز QR..." : "توليد رمز QR للدخول الآن"}</span>
+                      </button>
+                    </div>
+                  )}
+                </div>
+              )}
+
+              {/* الطريقة 3: استيراد جلسة محفوظة */}
+              {authStep === "credentials" && authMethod === "session" && (
+                <div className="space-y-4">
                   <div>
                     <label className="mb-1.5 block text-sm font-medium text-slate-700">
-                      رمز التحقق (OTP)
+                      كود الجلسة المحفوظ (StringSession)
+                    </label>
+                    <textarea
+                      dir="ltr"
+                      rows={3}
+                      value={manualSessionInput}
+                      onChange={(e) => setManualSessionInput(e.target.value)}
+                      placeholder="1BVtsOH..."
+                      className="w-full rounded-lg border border-slate-200 bg-white px-3.5 py-2.5 text-xs font-mono text-slate-900 outline-none focus:border-sky-600 focus:ring-2 focus:ring-sky-600/15"
+                    />
+                    <p className="mt-1.5 text-xs text-slate-500">
+                      إذا كان لديك كود جلسة من تشغيل سابق أو من نفس النظام، الصقه هنا للدخول فوراً دون أي كود.
+                    </p>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => void handleRestoreSession(manualSessionInput)}
+                    disabled={authLoading}
+                    className="inline-flex items-center gap-2 rounded-lg bg-slate-900 px-5 py-2.5 text-sm font-medium text-white hover:bg-slate-800 disabled:opacity-50 whitespace-nowrap"
+                  >
+                    <Upload className="h-4 w-4" />
+                    <span>{authLoading ? "جاري التحقق من الجلسة..." : "دخول بالجلسة المحفوظة"}</span>
+                  </button>
+                </div>
+              )}
+
+              {/* خطوة إضافية: إذا طلب تيليجرام ربط بريد إلكتروني للرقم (SentCodeTypeSetUpEmailRequired) */}
+              {authStep === "setup_email" && (
+                <form onSubmit={handleSendSetupEmail} className="space-y-4">
+                  <div className="rounded-lg border border-amber-200 bg-amber-50/70 p-4 text-xs leading-relaxed text-amber-900">
+                    <p className="font-semibold">تيليجرام يطلب تأكيد بريد إلكتروني لهذا الرقم</p>
+                    <p className="mt-1">
+                      أدخل بريدك الإلكتروني لإرسال رمز تأكيد إليه، أو يمكنك تجاوز هذه الخطوة تماماً باستخدام الدخول عبر QR.
+                    </p>
+                  </div>
+                  <div>
+                    <label className="mb-1.5 block text-sm font-medium text-slate-700">
+                      البريد الإلكتروني
+                    </label>
+                    <div className="relative">
+                      <Mail className="pointer-events-none absolute top-3 left-3.5 h-4 w-4 text-slate-400" />
+                      <input
+                        type="email"
+                        dir="ltr"
+                        required
+                        autoFocus
+                        value={setupEmail}
+                        onChange={(e) => setSetupEmail(e.target.value)}
+                        placeholder="name@example.com"
+                        className="w-full rounded-lg border border-slate-200 bg-white py-2.5 pr-3.5 pl-10 text-sm font-mono text-slate-900 outline-none focus:border-sky-600 focus:ring-2 focus:ring-sky-600/15"
+                      />
+                    </div>
+                  </div>
+                  <div className="flex flex-wrap items-center gap-3">
+                    <button
+                      type="submit"
+                      disabled={authLoading}
+                      className="rounded-lg bg-sky-600 px-5 py-2.5 text-sm font-medium text-white hover:bg-sky-700 disabled:opacity-50 whitespace-nowrap"
+                    >
+                      {authLoading ? "جاري الإرسال..." : "إرسال رمز للبريد"}
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => void switchToQrDirectly()}
+                      className="rounded-lg border border-slate-200 bg-white px-4 py-2.5 text-sm font-medium text-sky-700 hover:bg-slate-50 whitespace-nowrap"
+                    >
+                      الدخول عبر QR بدلاً من ذلك
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        void cancelPendingCodeOnServer();
+                        setAuthStep("credentials");
+                        setAuthError("");
+                      }}
+                      className="rounded-lg border border-slate-200 bg-white px-4 py-2.5 text-sm font-medium text-slate-700 hover:bg-slate-50 whitespace-nowrap"
+                    >
+                      رجوع
+                    </button>
+                  </div>
+                </form>
+              )}
+
+              {authStep === "setup_email_code" && (
+                <form onSubmit={handleVerifySetupEmail} className="space-y-4">
+                  <p className="text-sm text-slate-600">
+                    أدخل رمز التحقق المرسل إلى بريدك الإلكتروني (<span className="font-mono">{setupEmail}</span>):
+                  </p>
+                  <input
+                    type="text"
+                    inputMode="numeric"
+                    dir="ltr"
+                    required
+                    autoFocus
+                    value={setupEmailCode}
+                    onChange={(e) => setSetupEmailCode(e.target.value)}
+                    placeholder="123456"
+                    className="w-full rounded-lg border border-slate-200 bg-white px-3.5 py-2.5 text-center text-lg font-mono tracking-widest text-slate-900 outline-none focus:border-sky-600 focus:ring-2 focus:ring-sky-600/15"
+                  />
+                  <div className="flex flex-wrap items-center gap-3">
+                    <button
+                      type="submit"
+                      disabled={authLoading}
+                      className="rounded-lg bg-sky-600 px-5 py-2.5 text-sm font-medium text-white hover:bg-sky-700 disabled:opacity-50 whitespace-nowrap"
+                    >
+                      {authLoading ? "جاري التأكيد..." : "تأكيد رمز البريد"}
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setAuthStep("setup_email")}
+                      className="rounded-lg border border-slate-200 bg-white px-4 py-2.5 text-sm font-medium text-slate-700 hover:bg-slate-50 whitespace-nowrap"
+                    >
+                      تغيير البريد
+                    </button>
+                  </div>
+                </form>
+              )}
+
+              {/* خطوة إدخال رمز التحقق + تشخيص قناة الوصول + إعادة الإرسال */}
+              {authStep === "code" && (
+                <form onSubmit={handleVerifyCode} className="space-y-4">
+                  {deliveryInfo && (
+                    <div
+                      className={`rounded-lg border p-4 text-xs leading-relaxed ${
+                        deliveryInfo.deliveryType === "firebase"
+                          ? "border-amber-200 bg-amber-50/70 text-amber-900"
+                          : "border-slate-200 bg-slate-50 text-slate-700"
+                      }`}
+                    >
+                      <p className="font-semibold text-slate-900">
+                        قناة التوصيل الحالية من تيليجرام: {deliveryInfo.label}
+                      </p>
+                      <p className="mt-1">{deliveryInfo.detail}</p>
+                      {deliveryInfo.emailPattern && (
+                        <p className="mt-1 font-mono text-slate-800">
+                          البريد المستهدف: {deliveryInfo.emailPattern}
+                        </p>
+                      )}
+                      {deliveryInfo.fragmentUrl && (
+                        <a
+                          href={deliveryInfo.fragmentUrl}
+                          target="_blank"
+                          rel="noreferrer"
+                          className="mt-2 inline-flex items-center gap-1 font-semibold text-sky-700 underline"
+                        >
+                          <span>فتح صفحة Fragment لاستلام الكود</span>
+                          <ExternalLink className="h-3.5 w-3.5" />
+                        </a>
+                      )}
+                    </div>
+                  )}
+
+                  <div>
+                    <label className="mb-1.5 block text-sm font-medium text-slate-700">
+                      رمز التحقق (من التطبيق أو البريد الإلكتروني أو SMS)
                     </label>
                     <input
                       type="text"
@@ -505,11 +1114,12 @@ export const ConnectionPanel: React.FC<ConnectionPanelProps> = ({
                       autoFocus
                       value={phoneCode}
                       onChange={(e) => setPhoneCode(e.target.value)}
-                      placeholder="12345"
+                      placeholder={deliveryInfo?.codeLength === 6 ? "123456" : "12345"}
                       className="w-full rounded-lg border border-slate-200 bg-white px-3.5 py-2.5 text-center text-lg font-mono tracking-widest text-slate-900 outline-none focus:border-sky-600 focus:ring-2 focus:ring-sky-600/15"
                     />
                   </div>
-                  <div className="flex items-center gap-3">
+
+                  <div className="flex flex-wrap items-center gap-3">
                     <button
                       type="submit"
                       disabled={authLoading}
@@ -517,10 +1127,28 @@ export const ConnectionPanel: React.FC<ConnectionPanelProps> = ({
                     >
                       {authLoading ? "جاري التحقق..." : "تأكيد الرمز"}
                     </button>
+
+                    <button
+                      type="button"
+                      onClick={() => void handleResendCode()}
+                      disabled={resendLoading || resendCooldown > 0}
+                      className="inline-flex items-center gap-1.5 rounded-lg border border-slate-200 bg-white px-4 py-2.5 text-xs font-medium text-slate-800 hover:bg-slate-50 disabled:opacity-50 whitespace-nowrap shrink-0 tabular-nums"
+                    >
+                      <RefreshCw className={`h-3.5 w-3.5 ${resendLoading ? "animate-spin" : ""}`} />
+                      <span>
+                        {resendCooldown > 0
+                          ? `إعادة الإرسال (${resendCooldown}ث)`
+                          : `لم يصلني؟ أعد الإرسال عبر ${deliveryInfo?.nextTypeLabel || "قناة بديلة"}`}
+                      </span>
+                    </button>
+
                     <button
                       type="button"
                       onClick={() => {
+                        void cancelPendingCodeOnServer();
                         setAuthStep("credentials");
+                        setDeliveryInfo(null);
+                        setResendCooldown(0);
                         setAuthError("");
                       }}
                       className="rounded-lg border border-slate-200 bg-white px-4 py-2.5 text-sm font-medium text-slate-700 hover:bg-slate-50 whitespace-nowrap shrink-0"
@@ -528,9 +1156,21 @@ export const ConnectionPanel: React.FC<ConnectionPanelProps> = ({
                       تعديل الرقم
                     </button>
                   </div>
+
+                  <div className="pt-1">
+                    <button
+                      type="button"
+                      onClick={() => void switchToQrDirectly()}
+                      className="inline-flex items-center gap-1.5 text-xs font-medium text-sky-700 hover:text-sky-900"
+                    >
+                      <QrCode className="h-3.5 w-3.5" />
+                      <span>لم يصل الكود نهائياً؟ انتقل للدخول الفوري عبر رمز QR</span>
+                    </button>
+                  </div>
                 </form>
               )}
 
+              {/* خطوة كلمة مرور التحقق بخطوتين 2FA */}
               {authStep === "password" && (
                 <form onSubmit={handleVerifyPassword} className="space-y-4">
                   <p className="text-sm text-slate-600">
@@ -546,7 +1186,7 @@ export const ConnectionPanel: React.FC<ConnectionPanelProps> = ({
                       كلمة المرور السحابية
                     </label>
                     <input
-                      type="password"
+                      type={showSecrets ? "text" : "password"}
                       dir="ltr"
                       required
                       autoFocus
@@ -556,13 +1196,27 @@ export const ConnectionPanel: React.FC<ConnectionPanelProps> = ({
                       className="w-full rounded-lg border border-slate-200 bg-white px-3.5 py-2.5 text-sm text-slate-900 outline-none focus:border-sky-600 focus:ring-2 focus:ring-sky-600/15"
                     />
                   </div>
-                  <button
-                    type="submit"
-                    disabled={authLoading}
-                    className="rounded-lg bg-sky-600 px-5 py-2.5 text-sm font-medium text-white hover:bg-sky-700 disabled:opacity-50 whitespace-nowrap shrink-0"
-                  >
-                    {authLoading ? "جاري الدخول..." : "دخول بالحساب"}
-                  </button>
+                  <div className="flex flex-wrap items-center gap-3">
+                    <button
+                      type="submit"
+                      disabled={authLoading}
+                      className="rounded-lg bg-sky-600 px-5 py-2.5 text-sm font-medium text-white hover:bg-sky-700 disabled:opacity-50 whitespace-nowrap shrink-0"
+                    >
+                      {authLoading ? "جاري الدخول..." : "دخول بالحساب"}
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        void cancelPendingCodeOnServer();
+                        setAuthStep("credentials");
+                        setTwoFaPassword("");
+                        setAuthError("");
+                      }}
+                      className="rounded-lg border border-slate-200 bg-white px-4 py-2.5 text-sm font-medium text-slate-700 hover:bg-slate-50 whitespace-nowrap shrink-0"
+                    >
+                      البدء من جديد
+                    </button>
+                  </div>
                 </form>
               )}
             </div>

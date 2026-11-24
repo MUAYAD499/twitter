@@ -1,10 +1,11 @@
 import express from "express";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import QRCode from "qrcode";
 import telegramPkg from "telegram";
-import type { TelegramClient as TelegramClientType } from "telegram";
+import type { Api as ApiType, TelegramClient as TelegramClientType } from "telegram";
 
-const { TelegramClient, Api, sessions } = telegramPkg;
+const { TelegramClient, Api, sessions, password: passwordHelpers } = telegramPkg;
 const { StringSession } = sessions;
 
 const __filename = fileURLToPath(import.meta.url);
@@ -214,50 +215,335 @@ let currentSessionString = "";
 let cachedGroups: TargetGroup[] = [];
 const entityMap = new Map<string, unknown>();
 
-// جسر الوعود لتسجيل الدخول التفاعلي عبر الويب
+// حالة المصادقة المباشرة عبر MTProto (تدعم الهاتف، البريد الإلكتروني، ResendCode، 2FA، و QR)
+type CodeDeliveryType =
+  | "app"
+  | "email"
+  | "sms"
+  | "call"
+  | "fragment"
+  | "firebase"
+  | "setup_email"
+  | "unknown";
+
+interface SentCodeInfo {
+  deliveryType: CodeDeliveryType;
+  label: string;
+  detail: string;
+  emailPattern: string;
+  fragmentUrl: string;
+  codeLength: number;
+  nextTypeLabel: string;
+  timeoutSeconds: number;
+}
+
 interface PendingAuthFlow {
+  mode: "phone" | "qr";
   apiId: number;
   apiHash: string;
   phoneNumber: string;
-  stage: "starting" | "awaiting_code" | "awaiting_password" | "done" | "error";
-  isCodeViaApp: boolean;
+  phoneCodeHash: string;
+  deliveryInfo?: SentCodeInfo;
+  stage:
+    | "idle"
+    | "awaiting_code"
+    | "awaiting_email_setup"
+    | "awaiting_email_setup_code"
+    | "awaiting_qr"
+    | "awaiting_password"
+    | "done"
+    | "error";
   passwordHint?: string;
-  resolvePhoneCode?: (code: string) => void;
-  resolvePassword?: (pw: string) => void;
-  rejectCurrentStep?: (err: Error) => void;
-  resolveCurrentStep?: (payload: Record<string, unknown>) => void;
+  qrExpiresAt?: number;
+  qrAuthorizedUser?: AuthorizedUser;
 }
 
 let pendingAuth: PendingAuthFlow | null = null;
 
+function convertArabicDigitsToAscii(input: string): string {
+  const arabicIndic = "٠١٢٣٤٥٦٧٨٩";
+  const easternArabic = "۰۱۲۳۴۵۶۷۸۹";
+  return input
+    .replace(/[٠-٩]/g, (d) => String(arabicIndic.indexOf(d)))
+    .replace(/[۰-۹]/g, (d) => String(easternArabic.indexOf(d)));
+}
+
+function normalizePhoneNumber(raw: string): string {
+  let cleaned = convertArabicDigitsToAscii(raw).replace(/[\s\-().]/g, "").trim();
+  if (cleaned.startsWith("00")) {
+    cleaned = `+${cleaned.slice(2)}`;
+  }
+  if (cleaned && !cleaned.startsWith("+")) {
+    cleaned = `+${cleaned}`;
+  }
+  return cleaned;
+}
+
+function normalizeNumericInput(raw: string): string {
+  return convertArabicDigitsToAscii(raw).replace(/\s+/g, "").trim();
+}
+
+function createTelegramClient(
+  sessionString: string,
+  apiId: number,
+  apiHash: string
+): TelegramClientType {
+  return new TelegramClient(new StringSession(sessionString), apiId, apiHash, {
+    connectionRetries: 5,
+    requestRetries: 5,
+    deviceModel: "Telegram Desktop",
+    systemVersion: "Windows 11",
+    appVersion: "5.7.2 x64",
+    langCode: "ar",
+    systemLangCode: "ar",
+  });
+}
+
+function mapNextCodeTypeLabel(nextType: unknown): string {
+  if (!nextType || typeof nextType !== "object") return "";
+  const cls = (nextType as { className?: string }).className ?? "";
+  if (cls.includes("CodeTypeSms")) return "رسالة نصية SMS";
+  if (cls.includes("CodeTypeCall")) return "اتصال صوتي";
+  if (cls.includes("CodeTypeFlashCall")) return "مكالمة تحقق سريعة";
+  if (cls.includes("CodeTypeMissedCall")) return "مكالمة فائتة";
+  if (cls.includes("CodeTypeFragmentSms")) return "منصة Fragment";
+  return "قناة بديلة";
+}
+
+function describeSentCode(sentCode: InstanceType<typeof Api.auth.SentCode>): SentCodeInfo {
+  const typeObj = sentCode.type as unknown as {
+    className?: string;
+    length?: number;
+    emailPattern?: string;
+    url?: string;
+  };
+  const cls = typeObj?.className ?? "";
+  const nextTypeLabel = mapNextCodeTypeLabel(sentCode.nextType);
+  const timeoutSeconds = Number(sentCode.timeout ?? 60);
+  const codeLength = Number(typeObj?.length ?? 5);
+
+  if (cls.includes("SentCodeTypeApp")) {
+    return {
+      deliveryType: "app",
+      label: "رسالة داخل تطبيق تيليجرام",
+      detail:
+        "تم إرسال الرمز إلى محادثة (Telegram) الرسمية داخل التطبيق المفتوح على هاتفك أو حاسوبك.",
+      emailPattern: "",
+      fragmentUrl: "",
+      codeLength,
+      nextTypeLabel,
+      timeoutSeconds,
+    };
+  }
+
+  if (cls.includes("SentCodeTypeEmailCode")) {
+    const pattern = String(typeObj?.emailPattern ?? "");
+    return {
+      deliveryType: "email",
+      label: "البريد الإلكتروني المرتبط بالحساب",
+      detail: pattern
+        ? `تم إرسال رمز التحقق إلى بريدك الإلكتروني (${pattern}). تفقد البريد الوارد والرسائل غير المرغوب فيها (Spam).`
+        : "تم إرسال رمز التحقق إلى البريد الإلكتروني المرتبط بحسابك.",
+      emailPattern: pattern,
+      fragmentUrl: "",
+      codeLength,
+      nextTypeLabel,
+      timeoutSeconds,
+    };
+  }
+
+  if (cls.includes("SentCodeTypeSms")) {
+    return {
+      deliveryType: "sms",
+      label: "رسالة نصية SMS",
+      detail: "تم إرسال رمز التحقق برسالة نصية SMS إلى رقم هاتفك.",
+      emailPattern: "",
+      fragmentUrl: "",
+      codeLength,
+      nextTypeLabel,
+      timeoutSeconds,
+    };
+  }
+
+  if (
+    cls.includes("SentCodeTypeCall") ||
+    cls.includes("SentCodeTypeMissedCall") ||
+    cls.includes("SentCodeTypeFlashCall")
+  ) {
+    return {
+      deliveryType: "call",
+      label: "مكالمة هاتفية",
+      detail: "ستصلك مكالمة هاتفية من تيليجرام تحتوي على رمز التحقق.",
+      emailPattern: "",
+      fragmentUrl: "",
+      codeLength,
+      nextTypeLabel,
+      timeoutSeconds,
+    };
+  }
+
+  if (cls.includes("SentCodeTypeFragmentSms")) {
+    const url = String(typeObj?.url ?? "");
+    return {
+      deliveryType: "fragment",
+      label: "منصة Fragment",
+      detail: "هذا الرقم مربوط بمنصة Fragment، يرجى استلام الكود من صفحة Fragment.",
+      emailPattern: "",
+      fragmentUrl: url,
+      codeLength,
+      nextTypeLabel,
+      timeoutSeconds,
+    };
+  }
+
+  if (cls.includes("SentCodeTypeFirebaseSms")) {
+    return {
+      deliveryType: "firebase",
+      label: "تحقق أندرويد (Firebase)",
+      detail:
+        "تيليجرام أرسل طلباً لتطبيق أندرويد الرسمي وقد لا يصلك كود SMS عبر السيرفر. انتظر انتهاء العداد واضغط (إعادة إرسال عبر SMS/قناة بديلة) أو سجّل الدخول الفوري عبر رمز QR (مضمون 100%).",
+      emailPattern: "",
+      fragmentUrl: "",
+      codeLength,
+      nextTypeLabel,
+      timeoutSeconds,
+    };
+  }
+
+  if (cls.includes("SentCodeTypeSetUpEmailRequired")) {
+    return {
+      deliveryType: "setup_email",
+      label: "مطلوب تأكيد بريد إلكتروني",
+      detail:
+        "تيليجرام يطلب التحقق من بريد إلكتروني لهذا الرقم قبل إرسال الكود، أو يمكنك تسجيل الدخول مباشرة عبر رمز QR.",
+      emailPattern: "",
+      fragmentUrl: "",
+      codeLength: 6,
+      nextTypeLabel,
+      timeoutSeconds,
+    };
+  }
+
+  return {
+    deliveryType: "unknown",
+    label: cls || "قناة تحقق تيليجرام",
+    detail: "تم طلب رمز التحقق من خوادم تيليجرام.",
+    emailPattern: "",
+    fragmentUrl: "",
+    codeLength,
+    nextTypeLabel,
+    timeoutSeconds,
+  };
+}
+
 function translateTelegramError(err: unknown): { message: string; fatal: boolean } {
-  const raw = err instanceof Error ? err.message : String(err);
+  const anyErr = err as { errorMessage?: string; message?: string; seconds?: number };
+  const raw = anyErr?.errorMessage || (err instanceof Error ? err.message : String(err));
   const upper = raw.toUpperCase();
 
   if (upper.includes("API_ID_INVALID") || upper.includes("API_ID_PUBLISHED_FLOOD")) {
-    return { message: "بيانات API ID أو API Hash غير صالحة. يرجى التحقق منها في my.telegram.org.", fatal: true };
+    return {
+      message: "بيانات API ID أو API Hash غير صالحة. يرجى التحقق منها في my.telegram.org.",
+      fatal: true,
+    };
   }
   if (upper.includes("PHONE_NUMBER_INVALID")) {
-    return { message: "رقم الهاتف غير صحيح. تأكد من إدخاله بالصيغة الدولية (مثال: +966501234567).", fatal: true };
+    return {
+      message: "رقم الهاتف غير صحيح. تأكد من إدخاله بالصيغة الدولية (مثال: +966501234567).",
+      fatal: true,
+    };
+  }
+  if (upper.includes("PHONE_NUMBER_BANNED")) {
+    return {
+      message: "هذا الرقم محظور من استخدام تيليجرام.",
+      fatal: true,
+    };
   }
   if (upper.includes("PHONE_CODE_INVALID")) {
-    return { message: "رمز التحقق غير صحيح. يرجى التأكد من الرمز وإعادة المحاولة.", fatal: false };
+    return {
+      message: "رمز التحقق غير صحيح. يرجى التأكد من الرمز وإعادة المحاولة.",
+      fatal: false,
+    };
   }
   if (upper.includes("PHONE_CODE_EXPIRED")) {
-    return { message: "انتهت صلاحية رمز التحقق. يرجى طلب رمز جديد.", fatal: true };
+    return {
+      message: "انتهت صلاحية رمز التحقق. يرجى طلب رمز جديد أو استخدام الدخول عبر QR.",
+      fatal: true,
+    };
+  }
+  if (upper.includes("CODE_INVALID") || upper.includes("EMAIL_HASH_EXPIRED")) {
+    return {
+      message: "رمز البريد الإلكتروني غير صحيح أو منتهي الصلاحية.",
+      fatal: false,
+    };
+  }
+  if (upper.includes("EMAIL_INVALID")) {
+    return {
+      message: "عنوان البريد الإلكتروني غير صالح.",
+      fatal: false,
+    };
+  }
+  if (upper.includes("EMAIL_NOT_ALLOWED")) {
+    return {
+      message: "لا يمكن استخدام هذا البريد الإلكتروني للتحقق حالياً.",
+      fatal: false,
+    };
   }
   if (upper.includes("PASSWORD_HASH_INVALID")) {
-    return { message: "كلمة مرور التحقق بخطوتين (2FA) غير صحيحة. حاول مرة أخرى.", fatal: false };
+    return {
+      message: "كلمة مرور التحقق بخطوتين (2FA) غير صحيحة. حاول مرة أخرى.",
+      fatal: false,
+    };
+  }
+  if (upper.includes("SEND_CODE_UNAVAILABLE")) {
+    return {
+      message:
+        "تيليجرام حجب إرسال رسائل الكود لهذا الرقم عبر هذا الخادم مؤقتاً. استخدم (الدخول الفوري عبر رمز QR) كحل مضمون 100%.",
+      fatal: true,
+    };
+  }
+  if (upper.includes("AUTH_TOKEN_EXPIRED") || upper.includes("AUTH_TOKEN_INVALID")) {
+    return {
+      message: "انتهت صلاحية رمز QR. يرجى توليد رمز جديد ومسحه فوراً.",
+      fatal: true,
+    };
+  }
+  if (upper.includes("PHONE_NUMBER_FLOOD") || upper.includes("PHONE_PASSWORD_FLOOD")) {
+    return {
+      message: "تم تجاوز الحد المسموح لمحاولات هذا الرقم مؤقتاً. استخدم (الدخول الفوري عبر رمز QR) لتجاوز الحظر فوراً.",
+      fatal: true,
+    };
   }
   if (upper.includes("FLOOD_WAIT")) {
     const match = upper.match(/(\d+)/);
-    const secs = match ? match[1] : "بضع";
-    return { message: `فرض تيليجرام فترة انتظار مؤقتة (${secs} ثانية) بسبب كثرة المحاولات.`, fatal: true };
+    const secs = anyErr?.seconds ?? (match ? match[1] : "بضع");
+    return {
+      message: `فرض تيليجرام فترة انتظار مؤقتة (${secs} ثانية) على هذا الرقم/الطلب. يمكنك استخدام الدخول عبر رمز QR فوراً أو الانتظار.`,
+      fatal: true,
+    };
   }
   return { message: `حدث خطأ من تيليجرام: ${raw}`, fatal: true };
 }
 
+async function cancelPendingPhoneCodeSafely(
+  client: TelegramClientType | null,
+  flow: PendingAuthFlow | null
+): Promise<void> {
+  if (!client || !flow || !flow.phoneNumber || !flow.phoneCodeHash) return;
+  try {
+    await client.invoke(
+      new Api.auth.CancelCode({
+        phoneNumber: flow.phoneNumber,
+        phoneCodeHash: flow.phoneCodeHash,
+      })
+    );
+  } catch {
+    // تجاهل في حال انتهى الكود مسبقاً
+  }
+}
+
 async function disconnectActiveClient(): Promise<void> {
+  await cancelPendingPhoneCodeSafely(activeClient, pendingAuth);
   if (activeClient) {
     try {
       await activeClient.disconnect();
@@ -289,6 +575,32 @@ async function extractAuthorizedUser(client: TelegramClientType): Promise<Author
     username: userObj.username ?? "",
     phone: userObj.phone ?? "",
   };
+}
+
+async function finalizeAuthorizedLogin(client: TelegramClientType): Promise<{
+  status: "authorized";
+  user: AuthorizedUser;
+  sessionString: string;
+}> {
+  currentSessionString = String(client.session.save() ?? "");
+  currentUser = await extractAuthorizedUser(client);
+  if (pendingAuth) {
+    pendingAuth.stage = "done";
+  }
+  return {
+    status: "authorized",
+    user: currentUser,
+    sessionString: currentSessionString,
+  };
+}
+
+async function getTwoFaHint(client: TelegramClientType): Promise<string> {
+  try {
+    const srp = await client.invoke(new Api.account.GetPassword());
+    return String(srp.hint ?? "");
+  } catch {
+    return "";
+  }
 }
 
 // ==============================================================================
@@ -1129,7 +1441,7 @@ async function bootstrap() {
   // استعادة جلسة محفوظة (StringSession)
   app.post("/api/auth/restore", async (req, res) => {
     try {
-      const apiId = Number(req.body.apiId);
+      const apiId = Number(normalizeNumericInput(String(req.body.apiId ?? "")));
       const apiHash = String(req.body.apiHash ?? "").trim();
       const sessionString = String(req.body.sessionString ?? "").trim();
 
@@ -1139,175 +1451,334 @@ async function bootstrap() {
       }
 
       await disconnectActiveClient();
-      const client = new TelegramClient(new StringSession(sessionString), apiId, apiHash, {
-        connectionRetries: 5,
-      });
+      const client = createTelegramClient(sessionString, apiId, apiHash);
       await client.connect();
       const isAuth = await client.checkAuthorization();
       if (!isAuth) {
         await client.disconnect();
-        res.status(401).json({ error: "انتهت صلاحية الجلسة المحفوظة. يرجى تسجيل الدخول برقم الهاتف." });
+        res.status(401).json({
+          error: "انتهت صلاحية الجلسة المحفوظة. يرجى تسجيل الدخول برقم الهاتف أو رمز QR.",
+        });
         return;
       }
 
       activeClient = client;
-      currentSessionString = String(client.session.save() ?? sessionString);
-      currentUser = await extractAuthorizedUser(client);
-      res.json({ authorized: true, user: currentUser, sessionString: currentSessionString });
+      const result = await finalizeAuthorizedLogin(client);
+      res.json({ authorized: true, user: result.user, sessionString: result.sessionString });
     } catch (err) {
       const parsed = translateTelegramError(err);
       res.status(400).json({ error: parsed.message });
     }
   });
 
-  // الخطوة 1: إرسال رمز التحقق إلى رقم الهاتف
+  // الخطوة 1: إرسال رمز التحقق مباشرة مع فحص قناة التوصيل (App / Email / SMS / Firebase)
   app.post("/api/auth/send-code", async (req, res) => {
     try {
-      const apiId = Number(req.body.apiId);
+      const apiId = Number(normalizeNumericInput(String(req.body.apiId ?? "")));
       const apiHash = String(req.body.apiHash ?? "").trim();
-      const phoneNumber = String(req.body.phoneNumber ?? "").trim();
+      const phoneNumber = normalizePhoneNumber(String(req.body.phoneNumber ?? ""));
 
-      if (!apiId || Number.isNaN(apiId) || !apiHash || !phoneNumber) {
-        res.status(400).json({ error: "يرجى إدخال API ID و API Hash ورقم الهاتف بشكل صحيح." });
+      if (!apiId || Number.isNaN(apiId) || !apiHash || phoneNumber.length < 7) {
+        res.status(400).json({
+          error: "يرجى إدخال API ID و API Hash ورقم الهاتف بالصيغة الدولية الصحيحة.",
+        });
         return;
       }
 
       await disconnectActiveClient();
 
-      const client = new TelegramClient(new StringSession(""), apiId, apiHash, {
-        connectionRetries: 5,
-      });
+      const client = createTelegramClient("", apiId, apiHash);
       activeClient = client;
+      await client.connect();
 
-      const flow: PendingAuthFlow = {
+      const codeSettings = new Api.CodeSettings({
+        allowFlashcall: false,
+        allowMissedCall: false,
+        allowFirebase: false,
+        currentNumber: true,
+      });
+
+      let sendResult: ApiType.auth.TypeSentCode | null = null;
+      for (let attempt = 0; attempt < 3; attempt++) {
+        try {
+          sendResult = await client.invoke(
+            new Api.auth.SendCode({
+              phoneNumber,
+              apiId,
+              apiHash,
+              settings: codeSettings,
+            })
+          );
+          break;
+        } catch (err) {
+          const msg = String((err as { errorMessage?: string; message?: string })?.errorMessage ?? err).toUpperCase();
+          if (msg.includes("AUTH_RESTART") && attempt < 2) {
+            continue;
+          }
+          throw err;
+        }
+      }
+
+      if (!sendResult) {
+        throw new Error("لم يتم استلام استجابة من خادم تيليجرام.");
+      }
+
+      if (sendResult instanceof Api.auth.SentCodeSuccess) {
+        const finalAuth = await finalizeAuthorizedLogin(client);
+        res.json(finalAuth);
+        return;
+      }
+
+      const info = describeSentCode(sendResult);
+      pendingAuth = {
+        mode: "phone",
         apiId,
         apiHash,
         phoneNumber,
-        stage: "starting",
-        isCodeViaApp: true,
+        phoneCodeHash: sendResult.phoneCodeHash,
+        deliveryInfo: info,
+        stage: info.deliveryType === "setup_email" ? "awaiting_email_setup" : "awaiting_code",
       };
-      pendingAuth = flow;
 
-      const stepOutcome = new Promise<Record<string, unknown>>((resolve, reject) => {
-        flow.resolveCurrentStep = resolve;
-        flow.rejectCurrentStep = reject;
+      res.json({
+        status:
+          info.deliveryType === "setup_email" ? "setup_email_required" : "code_required",
+        deliveryInfo: info,
       });
-
-      // تشغيل تدفق client.start في الخلفية وربطه بوعود الويب
-      void (async () => {
-        try {
-          await client.start({
-            phoneNumber: async () => phoneNumber,
-            phoneCode: async (isCodeViaApp?: boolean) => {
-              flow.stage = "awaiting_code";
-              flow.isCodeViaApp = Boolean(isCodeViaApp);
-              if (flow.resolveCurrentStep) {
-                const resFn = flow.resolveCurrentStep;
-                flow.resolveCurrentStep = undefined;
-                flow.rejectCurrentStep = undefined;
-                resFn({ status: "code_required", isCodeViaApp: flow.isCodeViaApp });
-              }
-              return await new Promise<string>((resolveCode) => {
-                flow.resolvePhoneCode = resolveCode;
-              });
-            },
-            password: async (hint?: string) => {
-              flow.stage = "awaiting_password";
-              flow.passwordHint = hint ?? "";
-              if (flow.resolveCurrentStep) {
-                const resFn = flow.resolveCurrentStep;
-                flow.resolveCurrentStep = undefined;
-                flow.rejectCurrentStep = undefined;
-                resFn({ status: "password_required", hint: flow.passwordHint });
-              }
-              return await new Promise<string>((resolvePw) => {
-                flow.resolvePassword = resolvePw;
-              });
-            },
-            onError: async (err: Error) => {
-              const translated = translateTelegramError(err);
-              if (flow.rejectCurrentStep) {
-                const rejFn = flow.rejectCurrentStep;
-                flow.resolveCurrentStep = undefined;
-                flow.rejectCurrentStep = undefined;
-                rejFn(new Error(translated.message));
-              }
-              if (translated.fatal) {
-                flow.stage = "error";
-                return true;
-              }
-              return false;
-            },
-          });
-
-          flow.stage = "done";
-          currentSessionString = String(client.session.save() ?? "");
-          currentUser = await extractAuthorizedUser(client);
-
-          if (flow.resolveCurrentStep) {
-            const resFn = flow.resolveCurrentStep;
-            flow.resolveCurrentStep = undefined;
-            flow.rejectCurrentStep = undefined;
-            resFn({
-              status: "authorized",
-              user: currentUser,
-              sessionString: currentSessionString,
-            });
-          }
-        } catch (err) {
-          flow.stage = "error";
-          const translated = translateTelegramError(err);
-          if (flow.rejectCurrentStep) {
-            const rejFn = flow.rejectCurrentStep;
-            flow.resolveCurrentStep = undefined;
-            flow.rejectCurrentStep = undefined;
-            rejFn(new Error(translated.message));
-          }
-        }
-      })();
-
-      const result = await stepOutcome;
-      res.json(result);
     } catch (err) {
-      res.status(400).json({
-        error: err instanceof Error ? err.message : "تعذر بدء عملية التحقق.",
-      });
+      if (!pendingAuth) {
+        await disconnectActiveClient();
+      }
+      const translated = translateTelegramError(err);
+      res.status(400).json({ error: translated.message });
     }
   });
 
-  // الخطوة 2: التحقق من رمز OTP
+  // إعادة إرسال الكود عبر القناة البديلة (SMS أو اتصال) عند تأخر أو عدم وصول الكود
+  app.post("/api/auth/resend-code", async (_req, res) => {
+    try {
+      if (!activeClient || !pendingAuth || !pendingAuth.phoneCodeHash) {
+        res.status(400).json({ error: "لا توجد جلسة إرسال كود نشطة. اطلب كوداً جديداً أولاً." });
+        return;
+      }
+
+      const resendResult = await activeClient.invoke(
+        new Api.auth.ResendCode({
+          phoneNumber: pendingAuth.phoneNumber,
+          phoneCodeHash: pendingAuth.phoneCodeHash,
+        })
+      );
+
+      if (resendResult instanceof Api.auth.SentCodeSuccess) {
+        const finalAuth = await finalizeAuthorizedLogin(activeClient);
+        res.json(finalAuth);
+        return;
+      }
+
+      const info = describeSentCode(resendResult);
+      pendingAuth.phoneCodeHash = resendResult.phoneCodeHash;
+      pendingAuth.deliveryInfo = info;
+      pendingAuth.stage =
+        info.deliveryType === "setup_email" ? "awaiting_email_setup" : "awaiting_code";
+
+      res.json({
+        status:
+          info.deliveryType === "setup_email" ? "setup_email_required" : "code_required",
+        deliveryInfo: info,
+      });
+    } catch (err) {
+      const translated = translateTelegramError(err);
+      res.status(400).json({ error: translated.message });
+    }
+  });
+
+  // إلغاء الكود المعلق بأمان عند تغيير الرقم
+  app.post("/api/auth/cancel-code", async (_req, res) => {
+    await cancelPendingPhoneCodeSafely(activeClient, pendingAuth);
+    if (pendingAuth) {
+      pendingAuth.phoneCodeHash = "";
+      pendingAuth.stage = "idle";
+    }
+    res.json({ ok: true });
+  });
+
+  // في حال طلب تيليجرام ربط بريد إلكتروني للرقم (SentCodeTypeSetUpEmailRequired)
+  app.post("/api/auth/setup-email/send", async (req, res) => {
+    try {
+      const email = String(req.body.email ?? "").trim();
+      if (!email || !email.includes("@")) {
+        res.status(400).json({ error: "يرجى إدخال بريد إلكتروني صحيح." });
+        return;
+      }
+      if (!activeClient || !pendingAuth || !pendingAuth.phoneCodeHash) {
+        res.status(400).json({ error: "لا توجد جلسة تحقق نشطة." });
+        return;
+      }
+
+      await activeClient.invoke(
+        new Api.account.SendVerifyEmailCode({
+          purpose: new Api.EmailVerifyPurposeLoginSetup({
+            phoneNumber: pendingAuth.phoneNumber,
+            phoneCodeHash: pendingAuth.phoneCodeHash,
+          }),
+          email,
+        })
+      );
+
+      pendingAuth.stage = "awaiting_email_setup_code";
+      res.json({ ok: true, email });
+    } catch (err) {
+      const translated = translateTelegramError(err);
+      res.status(400).json({ error: translated.message });
+    }
+  });
+
+  app.post("/api/auth/setup-email/verify", async (req, res) => {
+    try {
+      const code = normalizeNumericInput(String(req.body.code ?? ""));
+      if (!code) {
+        res.status(400).json({ error: "يرجى إدخال رمز البريد الإلكتروني." });
+        return;
+      }
+      if (!activeClient || !pendingAuth || !pendingAuth.phoneCodeHash) {
+        res.status(400).json({ error: "لا توجد جلسة تحقق نشطة." });
+        return;
+      }
+
+      const verified = await activeClient.invoke(
+        new Api.account.VerifyEmail({
+          purpose: new Api.EmailVerifyPurposeLoginSetup({
+            phoneNumber: pendingAuth.phoneNumber,
+            phoneCodeHash: pendingAuth.phoneCodeHash,
+          }),
+          verification: new Api.EmailVerificationCode({ code }),
+        })
+      );
+
+      if (verified instanceof Api.account.EmailVerifiedLogin) {
+        if (verified.sentCode instanceof Api.auth.SentCodeSuccess) {
+          const finalAuth = await finalizeAuthorizedLogin(activeClient);
+          res.json(finalAuth);
+          return;
+        }
+        const info = describeSentCode(verified.sentCode);
+        pendingAuth.phoneCodeHash = verified.sentCode.phoneCodeHash;
+        pendingAuth.deliveryInfo = info;
+        pendingAuth.stage = "awaiting_code";
+        res.json({ status: "code_required", deliveryInfo: info });
+        return;
+      }
+
+      res.json({ status: "code_required", deliveryInfo: pendingAuth.deliveryInfo });
+    } catch (err) {
+      const translated = translateTelegramError(err);
+      res.status(400).json({ error: translated.message });
+    }
+  });
+
+  // الخطوة 2: التحقق من الرمز (يدعم كود الهاتف وأيضاً كود الإيميل EmailVerificationCode)
   app.post("/api/auth/verify-code", async (req, res) => {
     try {
-      const code = String(req.body.phoneCode ?? "").trim();
+      const code = normalizeNumericInput(String(req.body.phoneCode ?? ""));
       if (!code) {
         res.status(400).json({ error: "يرجى إدخال رمز التحقق." });
         return;
       }
-      const resolveCode = pendingAuth?.resolvePhoneCode;
-      if (!pendingAuth || !resolveCode) {
+      if (!activeClient || !pendingAuth || !pendingAuth.phoneCodeHash) {
         res.status(400).json({ error: "لا توجد عملية تسجيل دخول نشطة بانتظار الرمز." });
         return;
       }
 
-      const flow = pendingAuth;
-      const stepOutcome = new Promise<Record<string, unknown>>((resolve, reject) => {
-        flow.resolveCurrentStep = resolve;
-        flow.rejectCurrentStep = reject;
-      });
+      const { phoneNumber, phoneCodeHash, deliveryInfo } = pendingAuth;
+      const client = activeClient;
 
-      flow.resolvePhoneCode = undefined;
-      resolveCode(code);
+      let signInResult: ApiType.auth.TypeAuthorization | null = null;
+      const preferEmailVerification = deliveryInfo?.deliveryType === "email";
 
-      const result = await stepOutcome;
-      res.json(result);
+      try {
+        signInResult = await client.invoke(
+          new Api.auth.SignIn(
+            preferEmailVerification
+              ? {
+                  phoneNumber,
+                  phoneCodeHash,
+                  emailVerification: new Api.EmailVerificationCode({ code }),
+                }
+              : {
+                  phoneNumber,
+                  phoneCodeHash,
+                  phoneCode: code,
+                }
+          )
+        );
+      } catch (primaryErr) {
+        const primaryMsg = String(
+          (primaryErr as { errorMessage?: string; message?: string })?.errorMessage ?? primaryErr
+        ).toUpperCase();
+
+        if (primaryMsg.includes("SESSION_PASSWORD_NEEDED")) {
+          const hint = await getTwoFaHint(client);
+          pendingAuth.stage = "awaiting_password";
+          pendingAuth.passwordHint = hint;
+          res.json({ status: "password_required", hint });
+          return;
+        }
+
+        // تجربة الطريقة البديلة تلقائياً إذا طلب تيليجرام emailVerification أو phoneCode بالعكس
+        const shouldTryAlternate =
+          (preferEmailVerification &&
+            (primaryMsg.includes("EMAIL_NOT_ALLOWED") ||
+              primaryMsg.includes("PHONE_CODE_EMPTY"))) ||
+          (!preferEmailVerification &&
+            (primaryMsg.includes("EMAIL") || primaryMsg.includes("PHONE_CODE_EMPTY")));
+
+        if (shouldTryAlternate) {
+          try {
+            signInResult = await client.invoke(
+              new Api.auth.SignIn(
+                preferEmailVerification
+                  ? { phoneNumber, phoneCodeHash, phoneCode: code }
+                  : {
+                      phoneNumber,
+                      phoneCodeHash,
+                      emailVerification: new Api.EmailVerificationCode({ code }),
+                    }
+              )
+            );
+          } catch (altErr) {
+            const altMsg = String(
+              (altErr as { errorMessage?: string; message?: string })?.errorMessage ?? altErr
+            ).toUpperCase();
+            if (altMsg.includes("SESSION_PASSWORD_NEEDED")) {
+              const hint = await getTwoFaHint(client);
+              pendingAuth.stage = "awaiting_password";
+              pendingAuth.passwordHint = hint;
+              res.json({ status: "password_required", hint });
+              return;
+            }
+            throw altErr;
+          }
+        } else {
+          throw primaryErr;
+        }
+      }
+
+      if (signInResult instanceof Api.auth.AuthorizationSignUpRequired) {
+        res.status(400).json({
+          error: "هذا الرقم غير مسجل في تيليجرام بعد. يرجى التسجيل عبر تطبيق الهاتف الرسمي أولاً.",
+        });
+        return;
+      }
+
+      const finalAuth = await finalizeAuthorizedLogin(client);
+      res.json(finalAuth);
     } catch (err) {
-      res.status(400).json({
-        error: err instanceof Error ? err.message : "رمز التحقق غير صحيح.",
-      });
+      const translated = translateTelegramError(err);
+      res.status(400).json({ error: translated.message });
     }
   });
 
-  // الخطوة 3: التحقق من كلمة مرور 2FA
+  // الخطوة 3: التحقق من كلمة مرور 2FA مباشرة عبر SRP
   app.post("/api/auth/verify-password", async (req, res) => {
     try {
       const password = String(req.body.password ?? "");
@@ -1315,27 +1786,186 @@ async function bootstrap() {
         res.status(400).json({ error: "يرجى إدخال كلمة مرور التحقق بخطوتين." });
         return;
       }
-      const resolvePw = pendingAuth?.resolvePassword;
-      if (!pendingAuth || !resolvePw) {
+      if (!activeClient || !pendingAuth) {
         res.status(400).json({ error: "لا توجد جلسة بانتظار كلمة المرور." });
         return;
       }
 
-      const flow = pendingAuth;
-      const stepOutcome = new Promise<Record<string, unknown>>((resolve, reject) => {
-        flow.resolveCurrentStep = resolve;
-        flow.rejectCurrentStep = reject;
-      });
+      const srpResult = await activeClient.invoke(new Api.account.GetPassword());
+      const passwordCheck = await passwordHelpers.computeCheck(srpResult, password);
+      await activeClient.invoke(
+        new Api.auth.CheckPassword({
+          password: passwordCheck,
+        })
+      );
 
-      flow.resolvePassword = undefined;
-      resolvePw(password);
-
-      const result = await stepOutcome;
-      res.json(result);
+      const finalAuth = await finalizeAuthorizedLogin(activeClient);
+      res.json(finalAuth);
     } catch (err) {
-      res.status(400).json({
-        error: err instanceof Error ? err.message : "كلمة المرور غير صحيحة.",
+      const translated = translateTelegramError(err);
+      res.status(400).json({ error: translated.message });
+    }
+  });
+
+  // البديل المضمون 100%: تسجيل الدخول بمسح رمز QR من تطبيق تيليجرام المفتوح
+  app.post("/api/auth/qr/start", async (req, res) => {
+    try {
+      const apiId = Number(normalizeNumericInput(String(req.body.apiId ?? "")));
+      const apiHash = String(req.body.apiHash ?? "").trim();
+
+      if (!apiId || Number.isNaN(apiId) || !apiHash) {
+        res.status(400).json({ error: "يرجى إدخال API ID و API Hash أولاً." });
+        return;
+      }
+
+      await disconnectActiveClient();
+
+      const client = createTelegramClient("", apiId, apiHash);
+      activeClient = client;
+      await client.connect();
+
+      const tokenRes = await client.invoke(
+        new Api.auth.ExportLoginToken({
+          apiId,
+          apiHash,
+          exceptIds: [],
+        })
+      );
+
+      if (tokenRes instanceof Api.auth.LoginTokenSuccess) {
+        const finalAuth = await finalizeAuthorizedLogin(client);
+        res.json(finalAuth);
+        return;
+      }
+
+      if (tokenRes instanceof Api.auth.LoginTokenMigrateTo) {
+        await client._switchDC(tokenRes.dcId);
+        const migrated = await client.invoke(
+          new Api.auth.ImportLoginToken({ token: tokenRes.token })
+        );
+        if (migrated instanceof Api.auth.LoginTokenSuccess) {
+          const finalAuth = await finalizeAuthorizedLogin(client);
+          res.json(finalAuth);
+          return;
+        }
+        throw new Error("تعذر إتمام نقل الجلسة عبر QR.");
+      }
+
+      const tokenUrl = `tg://login?token=${Buffer.from(tokenRes.token).toString("base64url")}`;
+      const qrDataUrl = await QRCode.toDataURL(tokenUrl, {
+        width: 260,
+        margin: 2,
+        color: { dark: "#0F172A", light: "#FFFFFF" },
       });
+
+      pendingAuth = {
+        mode: "qr",
+        apiId,
+        apiHash,
+        phoneNumber: "",
+        phoneCodeHash: "",
+        stage: "awaiting_qr",
+        qrExpiresAt: tokenRes.expires,
+      };
+
+      res.json({
+        status: "qr_ready",
+        qrDataUrl,
+        expiresAt: tokenRes.expires,
+      });
+    } catch (err) {
+      if (!pendingAuth) {
+        await disconnectActiveClient();
+      }
+      const translated = translateTelegramError(err);
+      res.status(400).json({ error: translated.message });
+    }
+  });
+
+  app.post("/api/auth/qr/poll", async (_req, res) => {
+    try {
+      if (!activeClient || !pendingAuth || pendingAuth.mode !== "qr") {
+        res.status(400).json({ error: "لا توجد جلسة QR نشطة." });
+        return;
+      }
+
+      const client = activeClient;
+      const { apiId, apiHash } = pendingAuth;
+
+      try {
+        const tokenRes = await client.invoke(
+          new Api.auth.ExportLoginToken({
+            apiId,
+            apiHash,
+            exceptIds: [],
+          })
+        );
+
+        if (tokenRes instanceof Api.auth.LoginTokenSuccess) {
+          const finalAuth = await finalizeAuthorizedLogin(client);
+          res.json(finalAuth);
+          return;
+        }
+
+        if (tokenRes instanceof Api.auth.LoginTokenMigrateTo) {
+          await client._switchDC(tokenRes.dcId);
+          try {
+            const migrated = await client.invoke(
+              new Api.auth.ImportLoginToken({ token: tokenRes.token })
+            );
+            if (migrated instanceof Api.auth.LoginTokenSuccess) {
+              const finalAuth = await finalizeAuthorizedLogin(client);
+              res.json(finalAuth);
+              return;
+            }
+          } catch (migErr) {
+            const msg = String(
+              (migErr as { errorMessage?: string; message?: string })?.errorMessage ?? migErr
+            ).toUpperCase();
+            if (msg.includes("SESSION_PASSWORD_NEEDED")) {
+              const hint = await getTwoFaHint(client);
+              pendingAuth.stage = "awaiting_password";
+              pendingAuth.passwordHint = hint;
+              res.json({ status: "password_required", hint });
+              return;
+            }
+            throw migErr;
+          }
+        }
+
+        if (tokenRes instanceof Api.auth.LoginToken) {
+          const tokenUrl = `tg://login?token=${Buffer.from(tokenRes.token).toString("base64url")}`;
+          const qrDataUrl = await QRCode.toDataURL(tokenUrl, {
+            width: 260,
+            margin: 2,
+            color: { dark: "#0F172A", light: "#FFFFFF" },
+          });
+          pendingAuth.qrExpiresAt = tokenRes.expires;
+          res.json({
+            status: "qr_pending",
+            qrDataUrl,
+            expiresAt: tokenRes.expires,
+          });
+          return;
+        }
+      } catch (pollErr) {
+        const msg = String(
+          (pollErr as { errorMessage?: string; message?: string })?.errorMessage ?? pollErr
+        ).toUpperCase();
+        if (msg.includes("SESSION_PASSWORD_NEEDED")) {
+          const hint = await getTwoFaHint(client);
+          pendingAuth.stage = "awaiting_password";
+          pendingAuth.passwordHint = hint;
+          res.json({ status: "password_required", hint });
+          return;
+        }
+        throw pollErr;
+      }
+
+      res.json({ status: "qr_pending" });
+    } catch (err) {
+      const translated = translateTelegramError(err);
+      res.status(400).json({ error: translated.message });
     }
   });
 
